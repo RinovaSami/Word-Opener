@@ -37,6 +37,32 @@ Options:
   --no-browser  Don't auto-open the browser
 ```
 
+## Windows EXE (no Python required)
+
+Download `WordOpener.exe` from the [Releases](../../releases) page (or the
+latest [GitHub Actions artifact](../../actions/workflows/build-windows-exe.yml))
+and double-click it — no installation needed.
+
+```
+WordOpener.exe                     # launch with drag-and-drop file picker
+WordOpener.exe document.docx       # open a specific file
+WordOpener.exe --port 8080         # use a custom port
+WordOpener.exe --no-browser        # don't auto-open browser
+```
+
+### Build the EXE yourself (Windows)
+
+```bat
+git clone <this-repo>
+cd Word-Opener
+build.bat
+:: output: dist\WordOpener.exe
+```
+
+`build.bat` installs `pyinstaller`, `flask`, and `mammoth` automatically, then
+calls `pyinstaller word_opener.spec --clean` to produce a single, standalone
+`dist\WordOpener.exe` that embeds the Python runtime and all dependencies.
+
 ## Dependencies
 
 | Package  | Purpose               |
