@@ -1,23 +1,14 @@
 #!/usr/bin/env python3
 """
-Word Opener - Lightweight DOCX previewer with OneDrive/Word Online integration
+Word Opener - Lightweight DOCX previewer
 
 Usage:
     python word_opener.py [file.docx]
-    python word_opener.py --setup      # Configure OneDrive client ID
-
-Setup (first time for OneDrive):
-    1. Go to https://portal.azure.com > App registrations > New registration
-    2. Name it anything, select "Personal Microsoft accounts only"
-    3. Under "Redirect URIs" add: http://localhost (type: Public client/native)
-    4. Under "API permissions" add: Microsoft Graph > Delegated > Files.ReadWrite
-    5. Copy the "Application (client) ID"
-    6. Run: python word_opener.py --setup
+    python word_opener.py --port 8080
 """
 
 import os
 import sys
-import json
 import webbrowser
 import threading
 import time
@@ -34,86 +25,20 @@ def _require(pkg, pip_name=None):
         print(f"Missing dependency: pip install {pip_name or pkg}")
         sys.exit(1)
 
-mammoth  = _require("mammoth")
-flask    = _require("flask")
-msal_mod = _require("msal")
-requests = _require("requests")
+mammoth = _require("mammoth")
+_require("flask")
 
-from flask import Flask, render_template_string, request, jsonify
-import msal
-
-# ── paths & constants ────────────────────────────────────────────────────────
-
-CONFIG_DIR        = Path.home() / ".word-opener"
-CONFIG_FILE       = CONFIG_DIR / "config.json"
-TOKEN_CACHE_FILE  = CONFIG_DIR / "token_cache.json"
-
-SCOPES        = ["Files.ReadWrite", "offline_access"]
-AUTHORITY     = "https://login.microsoftonline.com/consumers"
-GRAPH_BASE    = "https://graph.microsoft.com/v1.0"
+from flask import Flask, render_template_string, request, jsonify, send_file
 
 # ── app state ────────────────────────────────────────────────────────────────
 
 _state = {
-    "docx_path":    None,
-    "html_content": None,
-    "msal_app":     None,
-    "token_cache":  msal.SerializableTokenCache(),
-    "device_flow":  None,
+    "docx_path":     None,
+    "html_content":  None,
+    "orig_filename": None,
 }
 
 app = Flask(__name__)
-app.secret_key = os.urandom(24)
-
-# ── config helpers ───────────────────────────────────────────────────────────
-
-def load_config():
-    if CONFIG_FILE.exists():
-        with open(CONFIG_FILE) as f:
-            return json.load(f)
-    return {}
-
-def save_config(cfg):
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(cfg, f, indent=2)
-
-def _persist_cache():
-    if _state["token_cache"].has_state_changed:
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        with open(TOKEN_CACHE_FILE, "w") as f:
-            f.write(_state["token_cache"].serialize())
-
-def _load_cache():
-    if TOKEN_CACHE_FILE.exists():
-        with open(TOKEN_CACHE_FILE) as f:
-            _state["token_cache"].deserialize(f.read())
-
-def get_msal_app():
-    if _state["msal_app"] is None:
-        cfg = load_config()
-        client_id = cfg.get("client_id", "").strip()
-        if not client_id:
-            return None
-        _load_cache()
-        _state["msal_app"] = msal.PublicClientApplication(
-            client_id,
-            authority=AUTHORITY,
-            token_cache=_state["token_cache"],
-        )
-    return _state["msal_app"]
-
-def get_token_silent():
-    app_obj = get_msal_app()
-    if not app_obj:
-        return None
-    accounts = app_obj.get_accounts()
-    if accounts:
-        result = app_obj.acquire_token_silent(SCOPES, account=accounts[0])
-        if result and "access_token" in result:
-            _persist_cache()
-            return result["access_token"]
-    return None
 
 # ── HTML template ────────────────────────────────────────────────────────────
 
@@ -154,6 +79,7 @@ TEMPLATE = r"""<!DOCTYPE html>
       padding: 7px 14px; border-radius: 6px; border: none;
       font-size: .85rem; font-weight: 600; cursor: pointer;
       transition: background .15s, opacity .15s;
+      text-decoration: none;
     }
     .btn:disabled { opacity: .5; cursor: not-allowed; }
     .btn-primary   { background: #2563eb; color: #fff; }
@@ -162,6 +88,8 @@ TEMPLATE = r"""<!DOCTYPE html>
     .btn-onedrive:hover:not(:disabled) { background: #005a9e; }
     .btn-ghost     { background: rgba(255,255,255,.15); color: #fff; border: 1px solid rgba(255,255,255,.3); }
     .btn-ghost:hover:not(:disabled) { background: rgba(255,255,255,.25); }
+    .btn-download  { background: #059669; color: #fff; }
+    .btn-download:hover:not(:disabled) { background: #047857; }
 
     /* ── drop zone ── */
     #drop-zone {
@@ -219,47 +147,20 @@ TEMPLATE = r"""<!DOCTYPE html>
       padding: .5em 1em; color: #6b7280;
     }
 
-    /* ── modal ── */
-    .modal-backdrop {
-      display: none; position: fixed; inset: 0;
-      background: rgba(0,0,0,.5); z-index: 200;
-      align-items: center; justify-content: center;
+    /* ── toast ── */
+    #toast {
+      position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+      background: #1e3a5f; color: #fff;
+      padding: 10px 20px; border-radius: 8px;
+      font-size: .85rem; opacity: 0;
+      transition: opacity .3s;
+      pointer-events: none; z-index: 300;
     }
-    .modal-backdrop.open { display: flex; }
-    .modal {
-      background: #fff; border-radius: 12px;
-      padding: 32px; max-width: 440px; width: 90%;
-      box-shadow: 0 20px 60px rgba(0,0,0,.3);
-      text-align: center;
-    }
-    .modal h3 { font-size: 1.2rem; margin-bottom: 12px; }
-    .modal p  { color: #6b7280; font-size: .9rem; margin-bottom: 20px; }
-
-    .device-code-box {
-      background: #f3f4f6; border-radius: 8px;
-      padding: 18px; margin: 16px 0;
-    }
-    .device-code-box .code {
-      font-family: monospace; font-size: 2rem; font-weight: 700;
-      letter-spacing: .15em; color: #1e3a5f;
-    }
-    .device-code-box .url { font-size: .8rem; color: #6b7280; margin-top: 6px; }
-
-    .spinner {
-      width: 24px; height: 24px;
-      border: 3px solid #e5e7eb;
-      border-top-color: #2563eb;
-      border-radius: 50%;
-      animation: spin .7s linear infinite;
-      margin: 0 auto 12px;
-    }
-    @keyframes spin { to { transform: rotate(360deg); } }
-
-    .status-msg { font-size: .85rem; color: #6b7280; margin-top: 8px; }
-    .error-msg  { font-size: .85rem; color: #dc2626; margin-top: 8px; }
+    #toast.show { opacity: 1; }
 
     @media (max-width: 640px) {
       #doc-content { padding: 32px 24px; }
+      #toolbar .actions .btn span { display: none; }
     }
   </style>
 </head>
@@ -267,24 +168,29 @@ TEMPLATE = r"""<!DOCTYPE html>
 
 <!-- toolbar -->
 <div id="toolbar">
-  <div class="logo">📄 Word Opener</div>
+  <div class="logo">&#128196; Word Opener</div>
   <div class="filename" id="toolbar-filename">{{ filename or 'No file loaded' }}</div>
   <div class="actions">
     <button class="btn btn-ghost" id="btn-open">Open file</button>
-    <button class="btn btn-onedrive" id="btn-onedrive" {% if not filename %}disabled{% endif %}>
-      ☁ Open in OneDrive
+    <button class="btn btn-download" id="btn-download" {% if not filename %}disabled{% endif %}>
+      &#8595; Download
     </button>
+    <a class="btn btn-onedrive" id="btn-onedrive"
+       href="https://onedrive.live.com" target="_blank" rel="noopener"
+       {% if not filename %}style="pointer-events:none;opacity:.5"{% endif %}>
+      &#9729; OneDrive
+    </a>
   </div>
 </div>
 <input type="file" id="file-input" accept=".docx">
 
 <!-- drop zone (shown when no file loaded) -->
-<div id="drop-zone" {% if filename %}{% else %}{% endif %}>
-  <div class="icon">📂</div>
+<div id="drop-zone">
+  <div class="icon">&#128194;</div>
   <h2>Open a DOCX file</h2>
   <p>Drag &amp; drop a file here, or click <strong>Open file</strong> above.</p>
   <button class="btn btn-primary" onclick="document.getElementById('file-input').click()">
-    Choose file…
+    Choose file&hellip;
   </button>
 </div>
 
@@ -293,31 +199,23 @@ TEMPLATE = r"""<!DOCTYPE html>
   <div id="doc-content">{{ html_content|safe if html_content else '' }}</div>
 </div>
 
-<!-- auth/upload modal -->
-<div class="modal-backdrop" id="modal">
-  <div class="modal">
-    <div id="modal-body"><!-- filled dynamically --></div>
-    <button class="btn btn-ghost" id="modal-cancel"
-            style="color:#374151;border-color:#d1d5db;margin-top:8px"
-            onclick="closeModal()">Cancel</button>
-  </div>
-</div>
+<div id="toast"></div>
 
 <script>
-const dropZone   = document.getElementById('drop-zone');
-const docWrap    = document.getElementById('doc-wrap');
-const docContent = document.getElementById('doc-content');
-const fileInput  = document.getElementById('file-input');
-const modal      = document.getElementById('modal');
-const modalBody  = document.getElementById('modal-body');
-const btnOneDrive = document.getElementById('btn-onedrive');
+const dropZone        = document.getElementById('drop-zone');
+const docWrap         = document.getElementById('doc-wrap');
+const docContent      = document.getElementById('doc-content');
+const fileInput       = document.getElementById('file-input');
+const btnDownload     = document.getElementById('btn-download');
+const btnOneDrive     = document.getElementById('btn-onedrive');
 const toolbarFilename = document.getElementById('toolbar-filename');
+const toast           = document.getElementById('toast');
 
 {% if filename %}
 dropZone.classList.add('has-file');
 {% endif %}
 
-// ── file loading ────────────────────────────────────────────────────────────
+// ── file loading ─────────────────────────────────────────────────────────────
 
 fileInput.addEventListener('change', e => {
   const file = e.target.files[0];
@@ -333,139 +231,56 @@ dropZone.addEventListener('drop', e => {
   dropZone.classList.remove('dragover');
   const file = e.dataTransfer.files[0];
   if (file && file.name.endsWith('.docx')) uploadForPreview(file);
-  else alert('Please drop a .docx file.');
+  else showToast('Please drop a .docx file.');
 });
 
 async function uploadForPreview(file) {
   const fd = new FormData();
   fd.append('file', file);
-  showModal(spinnerHTML('Converting document…'));
+  showToast('Converting\u2026');
   try {
     const res  = await fetch('/preview', { method: 'POST', body: fd });
     const data = await res.json();
-    if (data.error) { showModal(errorHTML(data.error)); return; }
+    if (data.error) { showToast('Error: ' + data.error); return; }
     docContent.innerHTML = data.html;
     docWrap.classList.add('visible');
     dropZone.classList.add('has-file');
     toolbarFilename.textContent = data.filename;
-    btnOneDrive.disabled = false;
-    closeModal();
+    btnDownload.disabled = false;
+    btnOneDrive.style.pointerEvents = '';
+    btnOneDrive.style.opacity = '';
+    showToast('Document loaded.');
   } catch (err) {
-    showModal(errorHTML('Failed to convert: ' + err.message));
+    showToast('Failed to convert: ' + err.message);
   }
 }
 
-// ── OneDrive upload ─────────────────────────────────────────────────────────
+// ── download current DOCX ────────────────────────────────────────────────────
 
-btnOneDrive.addEventListener('click', startOneDriveFlow);
+btnDownload.addEventListener('click', () => {
+  window.location.href = '/download';
+});
 
-async function startOneDriveFlow() {
-  // 1. Check if already authenticated
-  showModal(spinnerHTML('Checking authentication…'));
-  const checkRes  = await fetch('/onedrive/check-auth').then(r => r.json());
-  if (checkRes.authenticated) {
-    doUpload();
-  } else if (checkRes.no_client_id) {
-    showModal(setupRequiredHTML());
-  } else {
-    startDeviceCodeFlow();
-  }
-}
+// ── toast helper ─────────────────────────────────────────────────────────────
 
-async function startDeviceCodeFlow() {
-  showModal(spinnerHTML('Starting authentication…'));
-  const res  = await fetch('/onedrive/start-auth', { method: 'POST' }).then(r => r.json());
-  if (res.error) { showModal(errorHTML(res.error)); return; }
-
-  // Show device code to user
-  showModal(deviceCodeHTML(res.user_code, res.verification_uri, res.expires_in));
-  // Copy-friendly: open the page automatically
-  window.open(res.verification_uri, '_blank');
-
-  // Poll for completion
-  pollAuth();
-}
-
-let _pollTimer = null;
-async function pollAuth() {
-  const res = await fetch('/onedrive/poll-auth').then(r => r.json());
-  if (res.authenticated) {
-    closeModal();
-    doUpload();
-  } else if (res.error) {
-    showModal(errorHTML(res.error));
-  } else {
-    _pollTimer = setTimeout(pollAuth, 3000);
-  }
-}
-
-async function doUpload() {
-  showModal(spinnerHTML('Uploading to OneDrive…'));
-  const res = await fetch('/onedrive/upload', { method: 'POST' }).then(r => r.json());
-  if (res.error) { showModal(errorHTML(res.error)); return; }
-  showModal(successHTML(res.web_url));
-  window.open(res.web_url, '_blank');
-}
-
-// ── modal helpers ───────────────────────────────────────────────────────────
-
-function showModal(html) {
-  modalBody.innerHTML = html;
-  modal.classList.add('open');
-}
-function closeModal() {
-  clearTimeout(_pollTimer);
-  modal.classList.remove('open');
-  fetch('/onedrive/cancel-flow', { method: 'POST' }).catch(() => {});
-}
-
-function spinnerHTML(msg) {
-  return `<div class="spinner"></div><p>${msg}</p>`;
-}
-function errorHTML(msg) {
-  return `<h3>Error</h3><p class="error-msg">${msg}</p>`;
-}
-function deviceCodeHTML(code, url, expires) {
-  return `
-    <h3>Sign in to Microsoft</h3>
-    <p>A browser window has opened. Enter this code at <strong>${url}</strong>:</p>
-    <div class="device-code-box">
-      <div class="code">${code}</div>
-      <div class="url">${url}</div>
-    </div>
-    <div class="spinner"></div>
-    <p class="status-msg">Waiting for you to sign in… (expires in ${Math.floor(expires/60)} min)</p>`;
-}
-function successHTML(url) {
-  return `
-    <h3>✅ Uploaded!</h3>
-    <p>Your file has been uploaded to OneDrive and Word Online is opening.</p>
-    <a href="${url}" target="_blank" class="btn btn-onedrive" style="display:inline-flex;margin-top:8px">
-      Open in Word Online
-    </a>`;
-}
-function setupRequiredHTML() {
-  return `
-    <h3>OneDrive not configured</h3>
-    <p>
-      You need to register an Azure app and run<br>
-      <code style="background:#f3f4f6;padding:2px 6px;border-radius:4px">
-        python word_opener.py --setup
-      </code><br>
-      to add your client ID. See the README for instructions.
-    </p>`;
+let _toastTimer;
+function showToast(msg) {
+  toast.textContent = msg;
+  toast.classList.add('show');
+  clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => toast.classList.remove('show'), 3000);
 }
 </script>
 </body>
 </html>
 """
 
-# ── Flask routes ─────────────────────────────────────────────────────────────
+# ── Flask routes ──────────────────────────────────────────────────────────────
 
 @app.route("/")
 def index():
     html  = _state.get("html_content")
-    fname = Path(_state["docx_path"]).name if _state.get("docx_path") else None
+    fname = _state.get("orig_filename")
     return render_template_string(TEMPLATE, html_content=html, filename=fname)
 
 
@@ -475,11 +290,10 @@ def preview():
     if not f or not f.filename.endswith(".docx"):
         return jsonify(error="Please upload a .docx file.")
     try:
-        # save to a temp file so we can re-use it for upload
         tmp = tempfile.NamedTemporaryFile(suffix=".docx", delete=False)
         f.save(tmp.name)
-        _state["docx_path"] = tmp.name
-        _state["_orig_filename"] = f.filename
+        _state["docx_path"]    = tmp.name
+        _state["orig_filename"] = f.filename
 
         with open(tmp.name, "rb") as fh:
             result = mammoth.convert_to_html(fh)
@@ -489,109 +303,17 @@ def preview():
         return jsonify(error=str(e))
 
 
-@app.route("/onedrive/check-auth")
-def check_auth():
-    cfg = load_config()
-    if not cfg.get("client_id", "").strip():
-        return jsonify(authenticated=False, no_client_id=True)
-    token = get_token_silent()
-    return jsonify(authenticated=bool(token))
+@app.route("/download")
+def download():
+    path = _state.get("docx_path")
+    if not path or not os.path.exists(path):
+        return "No document loaded.", 404
+    name = _state.get("orig_filename") or Path(path).name
+    return send_file(path, as_attachment=True, download_name=name,
+                     mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
 
-@app.route("/onedrive/start-auth", methods=["POST"])
-def start_auth():
-    msal_app = get_msal_app()
-    if not msal_app:
-        return jsonify(error="OneDrive not configured. Run: python word_opener.py --setup")
-    flow = msal_app.initiate_device_flow(scopes=SCOPES)
-    if "error" in flow:
-        return jsonify(error=flow.get("error_description", flow["error"]))
-    _state["device_flow"] = flow
-    return jsonify(
-        user_code=flow["user_code"],
-        verification_uri=flow["verification_uri"],
-        expires_in=flow.get("expires_in", 900),
-    )
-
-
-@app.route("/onedrive/poll-auth")
-def poll_auth():
-    flow = _state.get("device_flow")
-    if not flow:
-        return jsonify(error="No auth flow in progress.")
-    msal_app = get_msal_app()
-    # Non-blocking check
-    result = msal_app.acquire_token_by_device_flow(flow, exit_condition=lambda f: True)
-    if result and "access_token" in result:
-        _state["device_flow"] = None
-        _persist_cache()
-        return jsonify(authenticated=True)
-    err = result.get("error", "") if result else ""
-    if err == "authorization_pending":
-        return jsonify(authenticated=False, pending=True)
-    return jsonify(error=result.get("error_description", err) if result else "Unknown error")
-
-
-@app.route("/onedrive/cancel-flow", methods=["POST"])
-def cancel_flow():
-    _state["device_flow"] = None
-    return jsonify(ok=True)
-
-
-@app.route("/onedrive/upload", methods=["POST"])
-def upload_to_onedrive():
-    token = get_token_silent()
-    if not token:
-        return jsonify(error="Not authenticated. Please sign in first.")
-
-    docx_path = _state.get("docx_path")
-    if not docx_path or not os.path.exists(docx_path):
-        return jsonify(error="No document loaded.")
-
-    filename = _state.get("_orig_filename") or Path(docx_path).name
-
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/octet-stream"}
-    upload_url = f"{GRAPH_BASE}/me/drive/root:/Word Opener/{filename}:/content"
-
-    try:
-        with open(docx_path, "rb") as fh:
-            resp = requests.put(upload_url, headers=headers, data=fh)
-        if resp.status_code not in (200, 201):
-            return jsonify(error=f"Upload failed ({resp.status_code}): {resp.text[:200]}")
-        data = resp.json()
-        web_url = data.get("webUrl", "")
-        # Append ?action=edit to open in Word Online editor directly
-        if web_url and "?action=edit" not in web_url:
-            web_url += "?action=edit"
-        return jsonify(web_url=web_url, name=data.get("name"))
-    except Exception as e:
-        return jsonify(error=str(e))
-
-
-# ── CLI setup ─────────────────────────────────────────────────────────────────
-
-def run_setup():
-    print("\n=== Word Opener – OneDrive Setup ===\n")
-    print("You need a Microsoft Azure app to upload to OneDrive.")
-    print("Steps:")
-    print("  1. Go to https://portal.azure.com > App registrations > New registration")
-    print("  2. Name: 'Word Opener'  |  Account type: Personal Microsoft accounts only")
-    print("  3. Redirect URI: Public client/native  ->  http://localhost")
-    print("  4. API Permissions: Add Microsoft Graph > Delegated > Files.ReadWrite")
-    print("  5. Copy the Application (client) ID shown on the Overview page\n")
-    client_id = input("Paste your Application (client) ID: ").strip()
-    if not client_id:
-        print("Aborted – no client ID entered.")
-        sys.exit(1)
-    cfg = load_config()
-    cfg["client_id"] = client_id
-    save_config(cfg)
-    # Clear token cache so a fresh login is triggered
-    if TOKEN_CACHE_FILE.exists():
-        TOKEN_CACHE_FILE.unlink()
-    print(f"\n✓ Saved to {CONFIG_FILE}")
-    print("Run 'python word_opener.py' and click 'Open in OneDrive' to sign in.\n")
-
+# ── entrypoint ────────────────────────────────────────────────────────────────
 
 def open_browser_delayed(url, delay=1.0):
     def _open():
@@ -601,18 +323,12 @@ def open_browser_delayed(url, delay=1.0):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Word Opener – DOCX previewer with OneDrive")
-    parser.add_argument("file", nargs="?", help="DOCX file to open")
-    parser.add_argument("--setup", action="store_true", help="Configure OneDrive client ID")
-    parser.add_argument("--port", type=int, default=5000, help="Local server port (default 5000)")
-    parser.add_argument("--no-browser", action="store_true", help="Don't auto-open browser")
+    parser = argparse.ArgumentParser(description="Word Opener – DOCX previewer")
+    parser.add_argument("file",        nargs="?", help="DOCX file to open")
+    parser.add_argument("--port",      type=int, default=5000, help="Local server port (default 5000)")
+    parser.add_argument("--no-browser", action="store_true",   help="Don't auto-open browser")
     args = parser.parse_args()
 
-    if args.setup:
-        run_setup()
-        return
-
-    # Pre-load a file if provided
     if args.file:
         p = Path(args.file).resolve()
         if not p.exists():
@@ -621,16 +337,16 @@ def main():
         if p.suffix.lower() != ".docx":
             print("Error: only .docx files are supported.")
             sys.exit(1)
-        _state["docx_path"] = str(p)
-        _state["_orig_filename"] = p.name
+        _state["docx_path"]    = str(p)
+        _state["orig_filename"] = p.name
         with open(p, "rb") as fh:
             result = mammoth.convert_to_html(fh)
         _state["html_content"] = result.value
 
     url = f"http://localhost:{args.port}"
-    print(f"\n Word Opener running at {url}")
-    if _state.get("docx_path"):
-        print(f"  File: {_state['_orig_filename']}")
+    print(f"\n  Word Opener running at {url}")
+    if _state.get("orig_filename"):
+        print(f"  File: {_state['orig_filename']}")
     print("  Press Ctrl+C to stop.\n")
 
     if not args.no_browser:
