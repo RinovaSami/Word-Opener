@@ -1,0 +1,56 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install flask mammoth pyinstaller
+
+      - name: Build EXE
+        run: pyinstaller word_opener.spec --clean
+
+      - name: Smoke-test (import check)
+        run: |
+          # Start the exe briefly to confirm it launches without crashing
+          $proc = Start-Process -FilePath "dist\WordOpener.exe" `
+                    -ArgumentList "--no-browser" `
+                    -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 5
+          if ($proc.HasExited -and $proc.ExitCode -ne 0) {
+            Write-Error "WordOpener.exe exited with code $($proc.ExitCode)"
+            exit 1
+          }
+          $proc | Stop-Process -Force -ErrorAction SilentlyContinue
+          Write-Host "Smoke test passed."
+        shell: pwsh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WordOpener-windows-x64
+          path: dist/WordOpener.exe
+          retention-days: 30
+
+      - name: Create release asset (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/WordOpener.exe

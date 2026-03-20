@@ -1,2 +1,5 @@
 flask>=3.0
 mammoth>=1.6
+
+# build-time only (needed to produce WordOpener.exe on Windows)
+# pyinstaller>=6.0
